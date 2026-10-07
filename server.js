@@ -46,7 +46,7 @@ function json(res, code, obj) {
 }
 
 function fail(res, e) {
-  const code = e && (e.code === "forbidden") ? 403 : 400;
+  const code = e && e.code === "forbidden" ? 403 : e && e.code === "version_conflict" ? 409 : 400;
   json(res, code, { error: e.message, code: e.code || "bad_request" });
 }
 
@@ -188,9 +188,15 @@ const server = http.createServer(async (req, res) => {
       }
       if (!sub && req.method === "PUT") {
         if ((body.role || "coach") !== "coach") return json(res, 403, { error: "仅教练可修订计划", code: "forbidden" });
-        const updated = PL.rebuildPlan(plan, body.patch || body, {});
-        if (Array.isArray(body.sessions) && body.sessions.length) {
-          updated.risk = PL.assessRisk(updated, riskContext(updated, body));
+        let updated;
+        if (plan.status === "executing") {
+          /* 执行中修订：按生效日期保留新旧版本，回到待确认并重评风险（高风险重新挂起复核） */
+          updated = PL.reviseEffectivePlan(plan, body.patch || body, { risk_context: p => riskContext(p, body) });
+        } else {
+          updated = PL.rebuildPlan(plan, body.patch || body, {});
+          if (Array.isArray(body.sessions) && body.sessions.length) {
+            updated.risk = PL.assessRisk(updated, riskContext(updated, body));
+          }
         }
         await Store.save(updated);
         return json(res, 200, { plan: updated });
@@ -205,6 +211,7 @@ const server = http.createServer(async (req, res) => {
           note: body.note || "",
           risk,
           risk_ctx: ctx,
+          base_version: body.base_version,
         });
         await Store.save(plan);
         return json(res, 200, { plan: plan });
@@ -216,6 +223,7 @@ const server = http.createServer(async (req, res) => {
           actor: body.actor || "",
           decision: body.decision,
           note: body.note || "",
+          base_version: body.base_version,
         });
         await Store.save(plan);
         return json(res, 200, { plan: plan });
@@ -240,14 +248,14 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (sub === "writeback/readiness" && req.method === "POST") {
-        const rec = PL.writeReadiness(plan, body.entry || body, { actor: body.actor, role: body.role || "coach" });
+        const rec = PL.writeReadiness(plan, body.entry || body, { actor: body.actor, role: body.role || "coach", base_version: body.base_version });
         await Store.save(plan);
         return json(res, 200, { plan, entry: rec });
       }
 
       if (sub === "writeback/load" && req.method === "POST") {
         const analysis = planAnalysis(plan, body);
-        const rec = PL.writeLoadWindow(plan, analysis, { actor: body.actor, role: body.role || "coach" });
+        const rec = PL.writeLoadWindow(plan, analysis, { actor: body.actor, role: body.role || "coach", base_version: body.base_version });
         await Store.save(plan);
         return json(res, 200, { plan, entry: rec, analysis });
       }
@@ -255,10 +263,10 @@ const server = http.createServer(async (req, res) => {
       if (sub === "writeback/prescription" && req.method === "POST") {
         let rec;
         if (body.prescription && typeof body.prescription === "object") {
-          rec = PL.writePrescription(plan, body.prescription, { actor: body.actor, role: body.role || "coach", date: body.date });
+          rec = PL.writePrescription(plan, body.prescription, { actor: body.actor, role: body.role || "coach", date: body.date, base_version: body.base_version });
         } else {
           const analysis = planAnalysis(plan, body);
-          rec = PL.writePrescription(plan, analysis.prescription, { actor: body.actor, role: body.role || "coach" });
+          rec = PL.writePrescription(plan, analysis.prescription, { actor: body.actor, role: body.role || "coach", base_version: body.base_version });
         }
         await Store.save(plan);
         return json(res, 200, { plan, entry: rec });

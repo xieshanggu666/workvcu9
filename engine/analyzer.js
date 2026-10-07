@@ -2,6 +2,7 @@
 /* 综合分析管道：由训练会话与晨测指标计算负荷、恢复与处方全景。
    可选传入协作计划（plan）与截止日期（asOf）：
    - 时间轴扩展到计划结束日，asOf 之后为计划投影日（is_projected）
+   - 多版本计划按生效日期合并新旧日程，投影跟随对应版本
    - 投影 ACWR / 体能-疲劳用于高风险预判
    - 当日处方附加计划课程与执行风险（高风险自动降级为恢复课） */
 
@@ -39,7 +40,9 @@ function analyze(athlete, opts = {}) {
       : [plan.start_date, plan.end_date];
   }
 
-  const plannedMap = plan ? new Map(plan.schedule.map(d => [d.date, d])) : null;
+  /* 计划日程按生效日期合并新旧版本：每个日期跟随当日生效的版本 */
+  const effectiveDays = plan ? PL.effectiveSchedule(plan) : [];
+  const plannedMap = plan ? new Map(effectiveDays.map(d => [d.date, d])) : null;
   const actualDaily = M.dailyLoads(sessions, "srpe", range);
 
   /* 拼接实际与投影负荷：计划期内 asOf 之后用计划目标负荷 */
@@ -190,8 +193,8 @@ function analyze(athlete, opts = {}) {
       as_of: asOf,
       peak_acwr: peak,
       peak_date: peakDate,
-      planned_total: plan.schedule.reduce((s, d) => s + d.target_load, 0),
-      planned_remaining: plan.schedule.filter(d => d.date > asOf).reduce((s, d) => s + d.target_load, 0),
+      planned_total: effectiveDays.reduce((s, d) => s + d.target_load, 0),
+      planned_remaining: effectiveDays.filter(d => d.date > asOf).reduce((s, d) => s + d.target_load, 0),
     };
   }
 

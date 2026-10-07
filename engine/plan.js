@@ -7,9 +7,13 @@
    - 高风险时康复师强制复核（approve / request_changes）后方可执行
    - 退回修改（revise / 复核退回）或暂停恢复时，旧确认与复核结果一律失效，
      上一版本的负荷 / 准备度 / 处方留痕归档，避免旧授权继续执行
+   - 执行中修订（reviseEffectivePlan）：按生效日期保留新旧版本——旧版本日程 /
+     确认 / 复核 / 风险快照存入 versions，生效日起由新版本接管并回到待确认；
+     运动员确认、康复师复核、负荷投影与每日回写均按日期跟随对应版本，
+     携带旧版本号（base_version）的迟到提交一律拒绝，避免旧页面覆盖新计划
    - 周期计划按四周块生成（递进 + 减载），展开为每日处方
-   - 负荷投影：实际历史 + 未来计划 → 投影 ACWR / 体能-疲劳
-   - 回写：准备度快照、实际负荷窗口、每日处方留痕 */
+   - 负荷投影：实际历史 + 未来计划（按版本合并日程）→ 投影 ACWR / 体能-疲劳
+   - 回写：准备度快照、实际负荷窗口、每日处方留痕（按生效日期归属版本） */
 
 const crypto = require("crypto");
 const M = require("./models");
@@ -72,6 +76,7 @@ const ACTION_LABEL = {
   pause: "暂停计划",
   resume: "恢复执行",
   revise: "教练撤回修订",
+  revise_effective: "按生效日修订",
   archive: "归档计划",
   writeback_readiness: "回写准备度",
   writeback_load: "回写负荷分析",
@@ -101,6 +106,15 @@ function clamp(x, lo, hi) {
 
 function validDate(s) {
   return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(parseIso(s).getTime());
+}
+
+/* 版本守卫：携带 base_version 的请求若落后于当前版本（旧页面迟到的提交），
+   一律拒绝，避免旧页面的确认 / 复核 / 回写覆盖新计划 */
+function assertCurrentVersion(plan, meta) {
+  const bv = meta && meta.base_version != null ? Number(meta.base_version) : null;
+  if (bv != null && bv !== plan.version) {
+    throw new PlanError(`计划已更新至 v${plan.version}（当前页面基于 v${bv}），请刷新后重试`, "version_conflict");
+  }
 }
 
 function addDays(iso, n) {
@@ -233,6 +247,8 @@ function buildPlan(input = {}, opts = {}) {
     status: "draft",
     weekly_targets: weeksMeta,
     schedule,
+    effective_from: cfg.start_date, // 当前版本生效起点；执行中修订时按生效日期保留新旧版本
+    versions: [],                   // 历史版本快照（含生效区间 / 日程 / 当版确认与复核）
     risk: null,
     review: null,
     confirmation: null,
@@ -297,6 +313,7 @@ function rebuildPlan(plan, patch, opts = {}) {
     note: cfg.note,
     weekly_targets: weeksMeta,
     schedule,
+    effective_from: cfg.start_date, // 草稿修订不保留旧日程，新版本自新的开始日期生效
     risk: null,
     review: null,
     confirmation: null,
@@ -311,6 +328,153 @@ function rebuildPlan(plan, patch, opts = {}) {
   });
   const editNote = [patch.note || "", hasTraces ? `v${prevVersion} 回写留痕已归档` : ""].filter(Boolean).join("；");
   addTimeline(plan, { at: ts, actor: cfg.coach_name, role: "coach", action: "edit", from: "draft", to: "draft", note: editNote });
+  return plan;
+}
+
+/* ---------- 版本视图（按生效日期保留新旧版本） ---------- */
+
+/* 指定日期生效的版本号：生效日期前归旧版本，之后归当前版本 */
+function versionAt(plan, date) {
+  const curFrom = plan.effective_from || plan.start_date;
+  if (date >= curFrom) return plan.version;
+  const versions = Array.isArray(plan.versions) ? plan.versions : [];
+  for (const v of versions) {
+    if (date >= v.effective_from && date <= v.effective_to) return v.version;
+  }
+  return versions.length ? versions[0].version : plan.version;
+}
+
+/* 合并各版本生效区间内的日程：每个日期归属于当日生效的版本。
+   负荷投影、执行风险与每日回写均按此跟随对应版本 */
+function effectiveSchedule(plan) {
+  const byDate = new Map();
+  const versions = Array.isArray(plan.versions) ? plan.versions : [];
+  for (const v of versions) {
+    for (const d of v.schedule || []) {
+      if (d.date >= v.effective_from && d.date <= v.effective_to) byDate.set(d.date, { ...d, version: v.version });
+    }
+  }
+  const curFrom = plan.effective_from || plan.start_date;
+  for (const d of plan.schedule || []) {
+    if (d.date >= curFrom) byDate.set(d.date, { ...d, version: plan.version });
+  }
+  return [...byDate.values()].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+}
+
+/* 日程条目上的 week 索引归属于其版本的 weekly_targets */
+function targetsForVersion(plan, version) {
+  if (version == null || version === plan.version) return plan.weekly_targets;
+  const v = (Array.isArray(plan.versions) ? plan.versions : []).find(x => x.version === version);
+  return v ? v.weekly_targets : plan.weekly_targets;
+}
+
+/* 教练修订执行中（已生效）计划：按生效日期保留新旧版本。
+   旧版本日程 / 确认 / 复核 / 风险快照存入 versions（生效区间截至生效日前一日），
+   新版本日程自生效日起生成；旧确认与复核作废、计划回到待确认并重新评估风险
+   （仍高风险则重新挂起康复师复核），旧版本回写留痕整批归档，
+   新确认 / 复核 / 投影 / 回写均跟随新版本 */
+function reviseEffectivePlan(plan, patch = {}, opts = {}) {
+  if (plan.status !== "executing") throw new PlanError("仅执行中的计划支持按生效日期修订", "not_editable");
+  const ts = opts.now || nowISO();
+  const effectiveFrom = validDate(patch.effective_from) ? patch.effective_from : fmtLocal(new Date());
+  const prevVersion = plan.version;
+  const snapshot = {
+    version: prevVersion,
+    effective_from: plan.effective_from || plan.start_date,
+    effective_to: addDays(effectiveFrom, -1),
+    start_date: plan.start_date,
+    end_date: plan.end_date,
+    weeks: plan.weeks,
+    base_load: plan.base_load,
+    increment: plan.increment,
+    deload: plan.deload,
+    note: plan.note,
+    weekly_targets: plan.weekly_targets,
+    schedule: plan.schedule,
+    confirmation: plan.confirmation,
+    review: plan.review,
+    risk: plan.risk,
+    superseded_at: ts,
+    superseded_by: prevVersion + 1,
+  };
+  const merged = {
+    title: plan.title, athlete_name: plan.athlete_name, coach_name: plan.coach_name,
+    sport: plan.sport, weeks: plan.weeks, base_load: plan.base_load,
+    increment: plan.increment, deload: plan.deload, note: plan.note,
+    ...patch,
+    start_date: effectiveFrom, // 新版本日程自生效日起生成
+  };
+  const cfg = normalizeInput(merged);
+  const targets = weeklyTargets(cfg.base_load, cfg.weeks, cfg.increment, cfg.deload);
+  const schedule = buildSchedule(targets, cfg.start_date, cfg.day_overrides || {});
+  const weeksMeta = targets.map((t, i) => ({
+    ...t,
+    date_start: addDays(cfg.start_date, i * 7),
+    date_end: addDays(cfg.start_date, i * 7 + 6),
+  }));
+  /* 旧版本回写留痕整批归档（与草稿修订一致），新版本从空白留痕重新积累 */
+  const wb = plan.writeback || {};
+  const archives = Array.isArray(wb.archives) ? wb.archives : [];
+  const readiness = Array.isArray(wb.readiness_snapshots) ? wb.readiness_snapshots : [];
+  const loadWindows = Array.isArray(wb.load_windows) ? wb.load_windows : [];
+  const prescriptions = Array.isArray(wb.daily_prescriptions) ? wb.daily_prescriptions : [];
+  const hasTraces = readiness.length || loadWindows.length || prescriptions.length;
+  if (hasTraces) {
+    archives.push({
+      version: prevVersion,
+      archived_at: ts,
+      readiness_snapshots: readiness,
+      load_windows: loadWindows,
+      daily_prescriptions: prescriptions,
+    });
+  }
+  const versions = Array.isArray(plan.versions) ? plan.versions : [];
+  versions.push(snapshot);
+  Object.assign(plan, {
+    title: cfg.title,
+    athlete_name: cfg.athlete_name,
+    coach_name: cfg.coach_name,
+    sport: cfg.sport,
+    sport_label: A.SPORT_POOL[cfg.sport].label,
+    /* start_date 保持原计划起点（历史日程自该日起），end_date 由新版本决定 */
+    end_date: addDays(cfg.start_date, cfg.weeks * 7 - 1),
+    weeks: cfg.weeks,
+    base_load: cfg.base_load,
+    increment: cfg.increment,
+    deload: cfg.deload,
+    note: cfg.note,
+    weekly_targets: weeksMeta,
+    schedule,
+    effective_from: effectiveFrom,
+    versions,
+    risk: null,
+    review: null,
+    confirmation: null,
+    writeback: {
+      readiness_snapshots: [],
+      load_windows: [],
+      daily_prescriptions: [],
+      archives,
+    },
+    status: "pending_confirmation",
+    updated_at: ts,
+    version: prevVersion + 1,
+  });
+  /* 与提交同级：基于当前负荷 / 准备度重新评估，高风险重新挂起康复师复核 */
+  const ctx = typeof opts.risk_context === "function" ? (opts.risk_context(plan) || {}) : (opts.risk_ctx || {});
+  const risk = opts.risk || assessRisk(plan, ctx);
+  plan.risk = risk;
+  if (risk.review_required) {
+    plan.review = { required: true, status: "pending", therapist: null, note: "", reviewed_at: null, version: plan.version };
+  }
+  const noteParts = [
+    `v${prevVersion + 1} 自 ${effectiveFrom} 起生效，v${prevVersion} 留存至 ${addDays(effectiveFrom, -1)}`,
+    hasTraces ? `v${prevVersion} 回写留痕已归档` : "",
+  ].filter(Boolean);
+  addTimeline(plan, {
+    at: ts, actor: cfg.coach_name, role: "coach", action: "revise_effective",
+    from: "executing", to: "pending_confirmation", note: noteParts.join("；"),
+  });
   return plan;
 }
 
@@ -393,6 +557,7 @@ function assessRisk(plan, ctx = {}) {
     factors,
     max_progression_pct: Math.round(maxProgression * 1000) / 10,
     peak_acwr: ctx.peak_acwr != null ? ctx.peak_acwr : null,
+    version: plan.version,
     evaluated_at: ctx.now || nowISO(),
   };
 }
@@ -401,7 +566,7 @@ function assessRisk(plan, ctx = {}) {
 
 function plannedDailyMap(plan) {
   const m = new Map();
-  for (const d of plan.schedule) m.set(d.date, d.target_load);
+  for (const d of effectiveSchedule(plan)) m.set(d.date, d.target_load);
   return m;
 }
 
@@ -449,18 +614,22 @@ function projectLoads(sessions, plan, asOf) {
 
 function executionRisk(plan, ctx) {
   const factors = [];
-  const item = plan.schedule.find(d => d.date === ctx.date);
+  const item = effectiveSchedule(plan).find(d => d.date === ctx.date);
   let weekRatio = null;
   let weekTarget = null;
   if (item) {
-    weekTarget = plan.weekly_targets[item.week - 1].target;
-    const expectedFrac = A.WEEK_SHAPE.slice(0, item.day).reduce((s, f) => s + f, 0) / A.WEEK_SHAPE.reduce((s, f) => s + f, 0);
-    const expected = Math.max(1, weekTarget * expectedFrac);
-    weekRatio = Math.round((ctx.week_accumulated / expected) * 100) / 100;
-    if (weekRatio > 1.15) {
-      factors.push(factor("week_ahead", "warn", `本周已完成 ${ctx.week_accumulated}，进度超前（应为 ${Math.round(expected)}），防止周内过载`, { ratio: weekRatio }));
-    } else if (weekRatio < 0.6) {
-      factors.push(factor("week_behind", "info", `本周累计 ${ctx.week_accumulated} 低于预期进度 ${Math.round(expected)}，注意后续补量节奏`, { ratio: weekRatio }));
+    const targets = targetsForVersion(plan, item.version);
+    const wt = targets[item.week - 1];
+    weekTarget = wt ? wt.target : null;
+    if (weekTarget != null) {
+      const expectedFrac = A.WEEK_SHAPE.slice(0, item.day).reduce((s, f) => s + f, 0) / A.WEEK_SHAPE.reduce((s, f) => s + f, 0);
+      const expected = Math.max(1, weekTarget * expectedFrac);
+      weekRatio = Math.round((ctx.week_accumulated / expected) * 100) / 100;
+      if (weekRatio > 1.15) {
+        factors.push(factor("week_ahead", "warn", `本周已完成 ${ctx.week_accumulated}，进度超前（应为 ${Math.round(expected)}），防止周内过载`, { ratio: weekRatio }));
+      } else if (weekRatio < 0.6) {
+        factors.push(factor("week_behind", "info", `本周累计 ${ctx.week_accumulated} 低于预期进度 ${Math.round(expected)}，注意后续补量节奏`, { ratio: weekRatio }));
+      }
     }
   }
   if (ctx.acwr != null && ctx.acwr >= RISK.ACWR_HIGH) {
@@ -517,13 +686,15 @@ function transition(plan, action, params = {}) {
     plan.risk = risk;
     plan.confirmation = null;
     if (risk.review_required) {
-      plan.review = { required: true, status: "pending", therapist: null, note: "", reviewed_at: null };
+      plan.review = { required: true, status: "pending", therapist: null, note: "", reviewed_at: null, version: plan.version };
     } else {
       plan.review = null;
     }
   }
 
   if (action === "confirm") {
+    /* 旧页面迟到的确认不得授权新版本 */
+    assertCurrentVersion(plan, params);
     if (plan.review && plan.review.required && plan.review.status !== "approved") {
       throw new PlanError("该计划存在高风险因素，须等待康复师复核通过后方可确认", "review_required");
     }
@@ -543,7 +714,7 @@ function transition(plan, action, params = {}) {
     const risk = params.risk || assessRisk(plan, params.risk_ctx || {});
     plan.risk = risk;
     if (risk.review_required) {
-      plan.review = { required: true, status: "pending", therapist: null, note: "", reviewed_at: null };
+      plan.review = { required: true, status: "pending", therapist: null, note: "", reviewed_at: null, version: plan.version };
     }
     to = "pending_confirmation";
   }
@@ -559,6 +730,8 @@ function transition(plan, action, params = {}) {
 /* 康复师复核：approve 解锁确认；request_changes 退回草稿 */
 function review(plan, params = {}) {
   if (params.role !== "therapist") throw new PlanError("仅康复师可复核", "forbidden");
+  /* 旧页面迟到的复核不得作用于新版本 */
+  assertCurrentVersion(plan, params);
   if (plan.status !== "pending_confirmation") throw new PlanError("仅待确认状态的计划可复核");
   if (!plan.review || !plan.review.required) throw new PlanError("该计划无需康复师复核");
   if (!["approve", "request_changes"].includes(params.decision)) throw new PlanError("复核决定必须为 approve 或 request_changes");
@@ -584,10 +757,11 @@ function upsertByDate(list, entry) {
 }
 
 function writeReadiness(plan, entry, meta = {}) {
+  assertCurrentVersion(plan, meta); // 旧页面迟到的回写不能覆盖新计划
   if (!validDate(entry.date)) throw new PlanError("回写准备度需要合法日期");
   if (!(entry.score >= 0 && entry.score <= 100)) throw new PlanError("准备度评分须在 0-100");
   const rec = {
-    version: plan.version,
+    version: versionAt(plan, entry.date), // 回写跟随记录日期生效的版本
     date: entry.date,
     score: Math.round(entry.score),
     label: entry.label || null,
@@ -600,13 +774,15 @@ function writeReadiness(plan, entry, meta = {}) {
 }
 
 function writeLoadWindow(plan, analysis, meta = {}) {
+  assertCurrentVersion(plan, meta);
   const days = analysis.days || [];
   if (!days.length) throw new PlanError("负荷分析结果为空，无法回写");
   const actualDays = days.filter(d => !d.is_projected);
+  const dateTo = actualDays.length ? actualDays[actualDays.length - 1].date : days[days.length - 1].date;
   const rec = {
-    version: plan.version,
+    version: versionAt(plan, dateTo), // 窗口按截止日归属版本
     date_from: actualDays.length ? actualDays[0].date : days[0].date,
-    date_to: actualDays.length ? actualDays[actualDays.length - 1].date : days[days.length - 1].date,
+    date_to: dateTo,
     sessions: analysis.totals ? analysis.totals.sessions : 0,
     actual_load: analysis.totals ? analysis.totals.total_load : actualDays.reduce((s, d) => s + (d.load || 0), 0),
     acwr: analysis.today ? analysis.today.acwr : null,
@@ -619,10 +795,11 @@ function writeLoadWindow(plan, analysis, meta = {}) {
 }
 
 function writePrescription(plan, prescription, meta = {}) {
+  assertCurrentVersion(plan, meta);
   const date = prescription.date || meta.date;
   if (!validDate(date)) throw new PlanError("回写处方需要合法日期");
   const rec = {
-    version: plan.version,
+    version: versionAt(plan, date), // 每日处方跟随当日生效的版本
     date,
     zone: prescription.intensity ? prescription.intensity.zone.key : null,
     zone_label: prescription.intensity ? prescription.intensity.zone.label : null,
@@ -672,6 +849,9 @@ module.exports = {
   buildSchedule,
   buildPlan,
   rebuildPlan,
+  reviseEffectivePlan,
+  versionAt,
+  effectiveSchedule,
   assessRisk,
   projectLoads,
   executionRisk,

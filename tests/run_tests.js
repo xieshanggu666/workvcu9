@@ -646,5 +646,122 @@ t("管道：计划休息日处方负荷归零", () => {
   assert.strictEqual(analysis.prescription.suggested_load, 0);
 });
 
+/* ---------- 协作计划：执行中修订与版本跟随 ---------- */
+t("计划：执行中修订按生效日期保留新旧版本，旧授权作废并回到待确认", () => {
+  const plan = PL.buildPlan({ start_date: "2026-03-09", weeks: 4, base_load: 500, increment: 0.05 });
+  PL.transition(plan, "submit", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
+  PL.transition(plan, "confirm", { role: "athlete", actor: "张运动员" });
+  PL.writeReadiness(plan, { date: "2026-03-10", score: 70 });
+  PL.reviseEffectivePlan(plan, { effective_from: "2026-03-16", base_load: 600 }, { risk: { review_required: false, level: "low", factors: [] } });
+  assert.strictEqual(plan.version, 2);
+  assert.strictEqual(plan.status, "pending_confirmation"); // 新版本须重新确认
+  assert.strictEqual(plan.confirmation, null);
+  assert.strictEqual(plan.effective_from, "2026-03-16");
+  assert.strictEqual(plan.start_date, "2026-03-09"); // 历史起点不变
+  assert.strictEqual(plan.schedule[0].date, "2026-03-16"); // 新版本日程自生效日起
+  /* 旧版本快照：生效区间、日程与当版确认完整留存 */
+  assert.strictEqual(plan.versions.length, 1);
+  const v1 = plan.versions[0];
+  assert.strictEqual(v1.version, 1);
+  assert.strictEqual(v1.effective_from, "2026-03-09");
+  assert.strictEqual(v1.effective_to, "2026-03-15");
+  assert(v1.confirmation && v1.confirmation.athlete === "张运动员");
+  /* 旧版本回写留痕整批归档 */
+  assert.strictEqual(plan.writeback.readiness_snapshots.length, 0);
+  assert.strictEqual(plan.writeback.archives.length, 1);
+  assert.strictEqual(plan.writeback.archives[0].version, 1);
+  /* 非执行中不可按生效日修订 */
+  assert.throws(() => PL.reviseEffectivePlan(PL.buildPlan({ weeks: 4 }), {}), /执行中/);
+});
+
+t("计划：合并日程与负荷投影按生效日期跟随对应版本", () => {
+  const plan = PL.buildPlan({ start_date: "2026-03-09", weeks: 2, base_load: 400, increment: 0.05 });
+  PL.transition(plan, "submit", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
+  PL.transition(plan, "confirm", { role: "athlete" });
+  const v1Load = new Map(plan.schedule.map(d => [d.date, d.target_load]));
+  PL.reviseEffectivePlan(plan, { effective_from: "2026-03-16", base_load: 900 }, { risk: { review_required: false, level: "low", factors: [] } });
+  const eff = PL.effectiveSchedule(plan);
+  const d10 = eff.find(d => d.date === "2026-03-10");
+  const d16 = eff.find(d => d.date === "2026-03-16");
+  assert.strictEqual(d10.version, 1);
+  assert.strictEqual(d10.target_load, v1Load.get("2026-03-10"));
+  assert.strictEqual(d16.version, 2);
+  /* 投影：生效日前（含未来日）仍按 v1，生效日起按 v2 */
+  const proj = PL.projectLoads([], plan, "2026-03-08");
+  assert.strictEqual(proj.daily.find(d => d.date === "2026-03-10").load, v1Load.get("2026-03-10"));
+  assert.strictEqual(proj.daily.find(d => d.date === "2026-03-16").load, d16.target_load);
+  assert(d16.target_load > v1Load.get("2026-03-10"));
+  /* 执行风险的周目标同样跟随日期所属版本 */
+  const r1 = PL.executionRisk(plan, { date: "2026-03-10", acwr: 1.0, readiness: 80, week_accumulated: 0 });
+  const r2 = PL.executionRisk(plan, { date: "2026-03-16", acwr: 1.0, readiness: 80, week_accumulated: 0 });
+  assert.strictEqual(r1.week_target, 400);
+  assert.strictEqual(r2.week_target, 900);
+});
+
+t("计划：回写按日期跟随对应版本，旧页面迟到的回写不能覆盖新计划", () => {
+  const plan = PL.buildPlan({ start_date: "2026-03-09", weeks: 2, base_load: 400 });
+  PL.transition(plan, "submit", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
+  PL.transition(plan, "confirm", { role: "athlete" });
+  PL.reviseEffectivePlan(plan, { effective_from: "2026-03-16", base_load: 600 }, { risk: { review_required: false, level: "low", factors: [] } });
+  PL.transition(plan, "confirm", { role: "athlete", base_version: 2 }); // 新版本重新确认
+  assert.strictEqual(plan.status, "executing");
+  /* 生效日前的回写归 v1，生效日起归 v2 */
+  PL.writeReadiness(plan, { date: "2026-03-12", score: 66 }, { base_version: 2 });
+  PL.writeReadiness(plan, { date: "2026-03-17", score: 80 }, { base_version: 2 });
+  PL.writePrescription(plan, { date: "2026-03-12", suggested_load: 300, plan_status: "planned" }, { base_version: 2 });
+  assert.strictEqual(plan.writeback.readiness_snapshots[0].version, 1);
+  assert.strictEqual(plan.writeback.readiness_snapshots[1].version, 2);
+  assert.strictEqual(plan.writeback.daily_prescriptions[0].version, 1);
+  /* 旧页面（基于 v1）迟到的回写被拒绝，新计划留痕不被覆盖 */
+  assert.throws(() => PL.writeReadiness(plan, { date: "2026-03-17", score: 10 }, { base_version: 1 }), /v2/);
+  assert.throws(() => PL.writePrescription(plan, { date: "2026-03-17", suggested_load: 1 }, { base_version: 1 }), /v2/);
+  assert.strictEqual(plan.writeback.readiness_snapshots.length, 2);
+  assert.strictEqual(plan.writeback.readiness_snapshots[1].score, 80);
+  /* 不携带版本信息的回写保持向后兼容 */
+  PL.writeReadiness(plan, { date: "2026-03-18", score: 55 });
+  assert.strictEqual(plan.writeback.readiness_snapshots.length, 3);
+  assert.strictEqual(plan.writeback.readiness_snapshots[2].version, 2);
+});
+
+t("计划：执行中高风险修订重新挂起复核，确认 / 复核跟随新版本且拒绝旧页面", () => {
+  const plan = PL.buildPlan({ start_date: "2026-03-09", weeks: 4, base_load: 500, increment: 0.05 });
+  PL.transition(plan, "submit", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
+  PL.transition(plan, "confirm", { role: "athlete" });
+  PL.reviseEffectivePlan(plan, { effective_from: "2026-03-16", increment: 0.25 }, {});
+  assert.strictEqual(plan.risk.version, 2); // 风险评估跟随新版本
+  assert.strictEqual(plan.review.required, true);
+  assert.strictEqual(plan.review.status, "pending");
+  assert.strictEqual(plan.review.version, 2); // 复核跟随新版本
+  assert.throws(() => PL.transition(plan, "confirm", { role: "athlete", base_version: 2 })); // 复核未过不可确认
+  /* 旧页面（基于 v1）迟到的复核被拒绝 */
+  assert.throws(() => PL.review(plan, { role: "therapist", decision: "approve", base_version: 1 }), /v2/);
+  PL.review(plan, { role: "therapist", decision: "approve", actor: "康复师王", base_version: 2 });
+  PL.transition(plan, "confirm", { role: "athlete", actor: "张运动员", base_version: 2 });
+  assert.strictEqual(plan.confirmation.version, 2);
+  /* 再次修订后，旧页面迟到的确认不得授权更新的版本 */
+  PL.reviseEffectivePlan(plan, { effective_from: "2026-03-23", increment: 0.05 }, { risk: { review_required: false, level: "low", factors: [] } });
+  assert.strictEqual(plan.version, 3);
+  assert.throws(() => PL.transition(plan, "confirm", { role: "athlete", base_version: 2 }), /v3/);
+  PL.transition(plan, "confirm", { role: "athlete", base_version: 3 });
+  assert.strictEqual(plan.status, "executing");
+  assert.strictEqual(plan.versions.length, 2);
+  assert.strictEqual(plan.versions[1].effective_from, "2026-03-16");
+  assert.strictEqual(plan.versions[1].effective_to, "2026-03-22");
+});
+
+t("管道：多版本计划的投影与当日课程跟随生效版本", () => {
+  const plan = PL.buildPlan({ start_date: "2026-03-09", weeks: 2, base_load: 400, increment: 0.05 });
+  PL.transition(plan, "submit", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
+  PL.transition(plan, "confirm", { role: "athlete" });
+  const v1Load = new Map(plan.schedule.map(d => [d.date, d.target_load]));
+  PL.reviseEffectivePlan(plan, { effective_from: "2026-03-16", base_load: 800 }, { risk: { review_required: false, level: "low", factors: [] } });
+  const analysis = AN.analyzeLog({ sessions: [], morning: [], profile: {}, plan, as_of: "2026-03-08" });
+  const d10 = analysis.days.find(d => d.date === "2026-03-10");
+  const d16 = analysis.days.find(d => d.date === "2026-03-16");
+  assert.strictEqual(d10.planned_load, v1Load.get("2026-03-10")); // 生效日前跟随 v1
+  assert(d16.planned_load > d10.planned_load); // 生效日起跟随 v2（基准 800 > 400）
+  assert(analysis.projection.planned_total > 0);
+});
+
 console.log("\n" + passed + " passed, " + failed + " failed");
 process.exit(failed ? 1 : 0);
