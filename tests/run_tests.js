@@ -646,5 +646,254 @@ t("管道：计划休息日处方负荷归零", () => {
   assert.strictEqual(analysis.prescription.suggested_load, 0);
 });
 
+/* ---------- 协作计划：按生效日期版本化修订 ---------- */
+
+/* 构造一个已提交确认、执行中的计划（低风险） */
+function executingPlan(opts) {
+  const plan = PL.buildPlan(Object.assign({ start_date: "2026-03-09", weeks: 6, base_load: 500, increment: 0.05 }, opts || {}));
+  PL.transition(plan, "submit", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
+  PL.transition(plan, "confirm", { role: "athlete", actor: "张运动员" });
+  return plan;
+}
+
+t("生效修订：执行中按生效日期切分，旧版本快照保留、新版本待确认", () => {
+  const plan = executingPlan();
+  /* 旧版本先留两条回写 */
+  PL.writeReadiness(plan, { date: "2026-03-09", score: 72 });
+  PL.writePrescription(plan, {
+    date: "2026-03-09", intensity: { zone: { key: "z3", label: "节奏区" } },
+    suggested_load: 400, suggested_range: [360, 440], planned: { planned_load: 400 }, plan_status: "planned",
+  });
+  const v1 = plan.version;
+  PL.amendPlan(plan, { weeks: 8, base_load: 560, increment: 0.06 }, {
+    effective_date: "2026-03-23",
+    actor: "李教练",
+    risk: { review_required: false, level: "low", factors: [] },
+  });
+  assert.strictEqual(plan.version, 2);
+  assert.strictEqual(plan.status, "pending_confirmation");
+  assert.strictEqual(plan.effective_date, "2026-03-23");
+  assert.strictEqual(plan.confirmation, null); // 新版本必须重新确认
+  assert.strictEqual(plan.versions.length, 1);
+  const snap = plan.versions[0];
+  assert.strictEqual(snap.version, 1);
+  assert.strictEqual(snap.effective_date, "2026-03-09");
+  assert.strictEqual(snap.schedule[0].date, "2026-03-09");
+  assert.strictEqual(snap.schedule[snap.schedule.length - 1].date, "2026-03-22"); // 旧版本截到生效日前一天
+  assert.strictEqual(snap.confirmation.athlete, "张运动员"); // 旧确认随旧版本保留
+  assert.strictEqual(snap.writeback.readiness_snapshots.length, 1);
+  assert.strictEqual(plan.schedule[0].date, "2026-03-23"); // 新版本自生效日起
+  assert.strictEqual(plan.writeback.readiness_snapshots.length, 0); // 新留痕从空白开始
+  assert(plan.timeline.some(e => e.action === "amend" && e.note.includes("v2 自 2026-03-23")));
+});
+
+t("生效修订：生效日不得早于/等于当前生效日，也不得超出周期", () => {
+  const plan = executingPlan();
+  assert.throws(() => PL.amendPlan(plan, {}, { effective_date: "2026-03-09", risk: { review_required: false } }), /生效日期/);
+  assert.throws(() => PL.amendPlan(plan, {}, { effective_date: "2026-05-01", risk: { review_required: false } }), /超出/);
+  assert.throws(() => PL.amendPlan(plan, {}, { effective_date: "bad", risk: { review_required: false } }));
+});
+
+t("生效修订：非执行中状态不允许；经 transition(amend) 同样生效", () => {
+  const draft = PL.buildPlan({ weeks: 4 });
+  assert.throws(() => PL.amendPlan(draft, {}, { effective_date: "2026-03-16" }), /执行中/);
+  const plan = executingPlan();
+  PL.transition(plan, "amend", {
+    role: "coach", effective_date: "2026-03-23", patch: { base_load: 600 },
+    risk: { review_required: false, level: "low", factors: [] },
+  });
+  assert.strictEqual(plan.status, "pending_confirmation");
+  assert.strictEqual(plan.base_load, 600);
+  assert.strictEqual(plan.versions.length, 1);
+});
+
+t("生效修订：新版本高风险自动挂康复师复核，复核通过后方可确认", () => {
+  const plan = executingPlan();
+  PL.amendPlan(plan, { increment: 0.25 }, {
+    effective_date: "2026-03-23",
+    risk: { review_required: true, level: "high", factors: [{ code: "progression", level: "high" }] },
+  });
+  assert.strictEqual(plan.review.status, "pending");
+  assert.throws(() => PL.transition(plan, "confirm", { role: "athlete" }));
+  PL.review(plan, { role: "therapist", decision: "approve", actor: "康复师王" });
+  assert.strictEqual(plan.review.version, 2);
+  PL.transition(plan, "confirm", { role: "athlete", actor: "张运动员" });
+  assert.strictEqual(plan.status, "executing");
+  assert.strictEqual(plan.confirmation.version, 2);
+  assert.strictEqual(plan.confirmation.effective_date, "2026-03-23");
+  /* 旧版本仍冻结着 v1 的确认与复核态 */
+  assert.strictEqual(plan.versions[0].confirmation.version, 1);
+});
+
+t("生效修订：教练撤回待确认的新版本，旧版本原样复活", () => {
+  const plan = executingPlan();
+  PL.writeReadiness(plan, { date: "2026-03-09", score: 70 });
+  PL.amendPlan(plan, { base_load: 620 }, {
+    effective_date: "2026-03-23", risk: { review_required: false, level: "low", factors: [] },
+  });
+  /* 新版本待确认期间产生的留痕不会污染旧版本 */
+  PL.writeReadiness(plan, { date: "2026-03-23", score: 55 });
+  PL.transition(plan, "revise", { role: "coach", actor: "李教练" });
+  assert.strictEqual(plan.status, "executing");
+  assert.strictEqual(plan.version, 1);
+  assert.strictEqual(plan.base_load, 500);
+  assert.strictEqual(plan.versions.length, 0);
+  assert(plan.confirmation);
+  assert.strictEqual(plan.writeback.readiness_snapshots.length, 1);
+  assert.strictEqual(plan.writeback.readiness_snapshots[0].date, "2026-03-09");
+  assert(plan.timeline.some(e => e.action === "amend_cancel"));
+});
+
+t("生效修订：康复师退回新版本，旧版本恢复执行；旧复核记录保留", () => {
+  const plan = executingPlan();
+  PL.amendPlan(plan, { increment: 0.25 }, {
+    effective_date: "2026-03-23",
+    risk: { review_required: true, level: "high", factors: [{ code: "x", level: "high" }] },
+  });
+  PL.review(plan, { role: "therapist", decision: "request_changes", note: "后半程增幅过大" });
+  assert.strictEqual(plan.status, "executing");
+  assert.strictEqual(plan.version, 1);
+  assert.strictEqual(plan.versions.length, 0);
+  assert(plan.confirmation);
+});
+
+t("版本归属：日期路由到对应版本，新旧版本留痕互不串台", () => {
+  const plan = executingPlan();
+  /* v1 留痕：生效日前 */
+  PL.writeReadiness(plan, { date: "2026-03-10", score: 71 });
+  PL.amendPlan(plan, { base_load: 600 }, {
+    effective_date: "2026-03-23", risk: { review_required: false, level: "low", factors: [] },
+  });
+  PL.transition(plan, "confirm", { role: "athlete" });
+  /* v2 留痕：生效日起 */
+  PL.writeReadiness(plan, { date: "2026-03-23", score: 66 });
+  PL.writeReadiness(plan, { date: "2026-04-01", score: 80 });
+  assert.strictEqual(plan.writeback.readiness_snapshots.length, 2);
+  assert(plan.writeback.readiness_snapshots.every(x => x.version === 2));
+  const old = plan.versions[0].writeback.readiness_snapshots;
+  assert.strictEqual(old.length, 1);
+  assert.strictEqual(old[0].version, 1);
+  /* 不指定 version 时按日期自动路由：旧日期迟到写入仍落旧版本 */
+  PL.writeReadiness(plan, { date: "2026-03-11", score: 69 });
+  assert.strictEqual(plan.versions[0].writeback.readiness_snapshots.length, 2);
+  assert.strictEqual(plan.writeback.readiness_snapshots.length, 2);
+  /* 处方同日覆盖仅在同版本内生效 */
+  PL.writePrescription(plan, {
+    date: "2026-03-23", intensity: { zone: { key: "z2", label: "耐力区" } },
+    suggested_load: 300, plan_status: "planned",
+  });
+  PL.writePrescription(plan, {
+    date: "2026-03-23", intensity: { zone: { key: "z1", label: "恢复区" } },
+    suggested_load: 200, plan_status: "adjusted",
+  });
+  assert.strictEqual(plan.writeback.daily_prescriptions.length, 1);
+  assert.strictEqual(plan.writeback.daily_prescriptions[0].suggested_load, 200);
+});
+
+t("迟到回写防护：旧页面携带旧 version 不能覆盖新生效计划（409 语义）", () => {
+  const plan = executingPlan();
+  PL.amendPlan(plan, { base_load: 600 }, {
+    effective_date: "2026-03-23", risk: { review_required: false, level: "low", factors: [] },
+  });
+  PL.transition(plan, "confirm", { role: "athlete" });
+  /* 旧页面停留在 v1，却把新生效日（属于 v2）的数据按 v1 提交 → 拒绝 */
+  assert.throws(() => PL.writeReadiness(plan, { date: "2026-03-23", score: 50, version: 1 }), (e) => {
+    return e.code === "version_conflict" && /旧版本不能覆盖新版本/.test(e.message);
+  });
+  /* 新页面携带 v1 去写旧日期同样拒绝，防反向串写 */
+  assert.throws(() => PL.writeReadiness(plan, { date: "2026-03-20", score: 50, version: 2 }), (e) => e.code === "version_conflict");
+  /* 显式携带正确版本可写 */
+  PL.writeReadiness(plan, { date: "2026-03-20", score: 73, version: 1 });
+  assert.strictEqual(plan.versions[0].writeback.readiness_snapshots.length, 1);
+  PL.writeReadiness(plan, { date: "2026-03-23", score: 66, version: 2 });
+  assert.strictEqual(plan.writeback.readiness_snapshots.length, 1);
+  /* 处方迟到回写同样拦截 */
+  assert.throws(() => PL.writePrescription(plan, {
+    date: "2026-03-24", version: 1,
+    intensity: { zone: { key: "z5", label: "无氧区" } }, suggested_load: 900, plan_status: "planned",
+  }), (e) => e.code === "version_conflict");
+});
+
+t("多版本连续修订：版本链与生效区间层层保留", () => {
+  const plan = executingPlan(); // v1: 03-09 起，6 周
+  PL.writeReadiness(plan, { date: "2026-03-09", score: 70 });
+  PL.amendPlan(plan, { base_load: 540 }, { effective_date: "2026-03-23", risk: { review_required: false, level: "low", factors: [] } });
+  PL.transition(plan, "confirm", { role: "athlete" });
+  PL.writeReadiness(plan, { date: "2026-03-23", score: 65 });
+  PL.amendPlan(plan, { base_load: 580 }, { effective_date: "2026-04-06", risk: { review_required: false, level: "low", factors: [] } });
+  PL.transition(plan, "confirm", { role: "athlete" });
+  PL.writeReadiness(plan, { date: "2026-04-06", score: 60 });
+  assert.strictEqual(plan.version, 3);
+  assert.strictEqual(plan.versions.length, 2);
+  assert.strictEqual(plan.versions[0].version, 1);
+  assert.strictEqual(plan.versions[1].version, 2);
+  assert.strictEqual(plan.versions[0].writeback.readiness_snapshots[0].version, 1);
+  assert.strictEqual(plan.versions[1].writeback.readiness_snapshots[0].version, 2);
+  assert.strictEqual(plan.writeback.readiness_snapshots[0].version, 3);
+  /* 任一日路由到正确版本 */
+  assert.strictEqual(PL.versionAt(plan, "2026-03-10").version, 1);
+  assert.strictEqual(PL.versionAt(plan, "2026-03-30").version, 2);
+  assert.strictEqual(PL.versionAt(plan, "2026-04-06").version, 3);
+});
+
+t("负荷投影：多版本拼接，投影行携带归属版本，峰值取未来计划", () => {
+  const plan = executingPlan();
+  const sessions = [];
+  for (let day = 0; day < 7; day++) {
+    sessions.push({ date: "2026-03-" + String(2 + day).padStart(2, "0"), rpe: 5, minutes: 60, avg_hr: 130, rest_hr: 55, max_hr: 196, sex: "m" });
+  }
+  PL.amendPlan(plan, { base_load: 900, increment: 0.1 }, {
+    effective_date: "2026-03-23", risk: { review_required: false, level: "low", factors: [] },
+  });
+  const proj = PL.projectLoads(sessions, plan, "2026-03-08");
+  const byDate = new Map(proj.daily.map(d => [d.date, d]));
+  assert.strictEqual(byDate.get("2026-03-16").version, 1); // 生效日前 → 旧版本
+  assert.strictEqual(byDate.get("2026-03-23").version, 2); // 生效日起 → 新版本
+  assert(proj.peak_date >= "2026-03-23");
+});
+
+t("执行风险：按当日归属版本取周目标与课程", () => {
+  const plan = executingPlan({ base_load: 500 });
+  PL.amendPlan(plan, { base_load: 900 }, {
+    effective_date: "2026-03-23", risk: { review_required: false, level: "low", factors: [] },
+  });
+  const before = PL.executionRisk(plan, { date: "2026-03-09", acwr: 1.0, readiness: 80, week_accumulated: 100 });
+  const after = PL.executionRisk(plan, { date: "2026-03-23", acwr: 1.0, readiness: 80, week_accumulated: 100 });
+  assert.strictEqual(before.version, 1);
+  assert.strictEqual(after.version, 2);
+  assert(after.week_target > before.week_target);
+});
+
+t("分析管道：多版本计划投影逐日带 plan_version，处方跟随当日版本", () => {
+  const plan = executingPlan();
+  PL.amendPlan(plan, { base_load: 700 }, {
+    effective_date: "2026-03-23", risk: { review_required: false, level: "low", factors: [] },
+  });
+  const r = AN.analyzeLog({ sessions: [], morning: [], profile: {}, plan, as_of: "2026-03-22" });
+  const byDate = new Map(r.days.map(d => [d.date, d]));
+  assert.strictEqual(byDate.get("2026-03-16").plan_version, 1);
+  assert.strictEqual(byDate.get("2026-03-23").plan_version, 2);
+  assert(r.projection.peak_version === 2);
+});
+
+t("暂停态修订（旧路径）：作废旧授权，草稿 rebuild 收回版本链并归档旧留痕", () => {
+  const plan = executingPlan();
+  PL.writeReadiness(plan, { date: "2026-03-10", score: 70 });
+  PL.amendPlan(plan, { base_load: 600 }, {
+    effective_date: "2026-03-23", risk: { review_required: false, level: "low", factors: [] },
+  });
+  /* 新版本尚未确认时不能暂停；模拟边缘：先确认 v2 再暂停，再 revise 回草稿 rebuild */
+  PL.transition(plan, "confirm", { role: "athlete" });
+  PL.writeReadiness(plan, { date: "2026-03-23", score: 60 });
+  PL.transition(plan, "pause", { role: "coach" });
+  PL.transition(plan, "revise", { role: "coach" });
+  assert.strictEqual(plan.status, "draft");
+  PL.rebuildPlan(plan, { weeks: 4 });
+  assert.strictEqual(plan.versions.length, 0);
+  /* v1 与 v2 的留痕都转入归档 */
+  const arcVersions = plan.writeback.archives.map(a => a.version).sort();
+  assert.deepStrictEqual(arcVersions, [1, 2]);
+});
+
 console.log("\n" + passed + " passed, " + failed + " failed");
 process.exit(failed ? 1 : 0);

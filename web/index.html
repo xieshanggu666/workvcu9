@@ -712,7 +712,19 @@ function actionButtons(plan) {
     html += btn("revise", "教练撤回修订", "ghost", role !== "coach");
   } else if (s === "executing") {
     html += btn("pause", "暂停", "blue", role !== "coach" && role !== "athlete");
+    html += btn("amend", "按生效日期修订", "amber", role !== "coach");
     html += btn("archive", "归档", "ghost", role !== "coach");
+  } else if (s === "pending_confirmation" && plan.versions && plan.versions.length) {
+    html += `<span class="badge risk-warn">v${plan.version} 新生效修订待确认（v${plan.versions[plan.versions.length - 1].version} 仍保留至生效日前）</span>`;
+    if (plan.review && plan.review.required) {
+      const pending = plan.review.status === "pending";
+      if (pending) {
+        html += btn("approve", "复核通过", "", role !== "therapist");
+        html += btn("request_changes", "退回修改（恢复旧版本）", "amber", role !== "therapist");
+      }
+    }
+    html += btn("confirm", "运动员确认新版本", "", role !== "athlete" || (plan.review && plan.review.required && plan.review.status !== "approved"));
+    html += btn("revise", "撤回修订（恢复旧版本）", "ghost", role !== "coach");
   } else if (s === "paused") {
     html += btn("resume", "恢复执行", "", role !== "coach" && role !== "athlete");
     html += btn("revise", "修订计划", "ghost", role !== "coach");
@@ -749,6 +761,42 @@ function reviewPanel(plan) {
     </div></div>`;
 }
 
+function versionsPanel(plan) {
+  const versions = plan.versions || [];
+  const wbCount = v => {
+    const w = v.writeback || {};
+    return (w.readiness_snapshots || []).length + (w.load_windows || []).length + (w.daily_prescriptions || []).length;
+  };
+  const rows = versions.map(v => {
+    const end = v.schedule && v.schedule.length ? v.schedule[v.schedule.length - 1].date : "—";
+    const conf = v.confirmation ? esc(v.confirmation.athlete) + " 已确认" : "—";
+    const rvTxt = v.review && v.review.required ? " · " + (v.review.status === "approved" ? "复核通过" : "复核记录") : "";
+    return `<tr>
+      <td>v${v.version}</td>
+      <td>${v.effective_date} ~ ${end}</td>
+      <td><span class="badge" style="background:var(--green)">已生效保留</span></td>
+      <td>${conf}${rvTxt}</td>
+      <td>${wbCount(v)} 条留痕</td>
+    </tr>`;
+  });
+  const activeStart = versions.length ? plan.effective_date : plan.start_date;
+  const activeState = plan.status === "pending_confirmation" && versions.length
+    ? `<span class="badge risk-warn">新生效修订待确认</span>`
+    : `<span class="badge" style="background:${state.meta.plan_statuses[plan.status].color}">${state.meta.plan_statuses[plan.status].label}</span>`;
+  rows.push(`<tr>
+    <td><b>v${plan.version}</b></td>
+    <td><b>${activeStart} ~ ${plan.end_date}</b></td>
+    <td>${activeState}</td>
+    <td>${plan.confirmation ? esc(plan.confirmation.athlete) + " 已确认" : "—"}</td>
+    <td>${wbCount(plan)} 条留痕</td>
+  </tr>`);
+  return `<div class="panel-card"><h3>计划版本（按生效日期保留新旧版本）</h3>
+    <table class="tbl"><thead><tr><th>版本</th><th>生效区间</th><th>状态</th><th>确认 / 复核</th><th>回写留痕</th></tr></thead>
+      <tbody>${rows.join("")}</tbody></table>
+    <div style="font-size:12px;color:var(--muted);margin-top:6px">运动员确认、康复师复核、风险评估、负荷投影与每日回写均跟随对应版本；旧版本迟到的回写只会写回旧版本，无法覆盖新生效计划。</div>
+  </div>`;
+}
+
 function writebackPanel(plan) {
   const wb = plan.writeback;
   const canAct = ["executing", "paused"].includes(plan.status);
@@ -758,12 +806,12 @@ function writebackPanel(plan) {
   const lpre = list => [...list].reverse().slice(0, 5);
   const archives = wb.archives || [];
   return `<div class="panel-card"><h3>回写（负荷分析 · 准备度 · 每日处方）
-      <span style="font-size:12px;color:var(--muted);font-weight:400">当前 v${plan.version}${archives.length ? " · 已归档 " + archives.length + " 个历史版本留痕" : ""}</span>
+      <span style="font-size:12px;color:var(--muted);font-weight:400">当前活动版本 v${plan.version}（${plan.effective_date} 起生效）${archives.length ? " · 草稿修订归档 " + archives.length + " 批" : ""}</span>
     </h3>
     <div class="kv" style="margin-bottom:10px">
       <span>最新准备度：<b>${lr ? lr.date + " " + lr.score + " 分（v" + (lr.version || plan.version) + "）" : "—"}</b></span>
-      <span>最新负荷窗口：<b>${lw ? lw.date_from + "~" + lw.date_to + "（实际 " + lw.actual_load + "）" : "—"}</b></span>
-      <span>处方留痕：<b>${wb.daily_prescriptions.length} 条（v${plan.version}）</b></span>
+      <span>最新负荷窗口：<b>${lw ? lw.date_from + "~" + lw.date_to + "（实际 " + lw.actual_load + "，v" + (lw.version || plan.version) + "）" : "—"}</b></span>
+      <span>本版本处方留痕：<b>${wb.daily_prescriptions.length} 条</b></span>
     </div>
     <div class="btn-row">
       <button class="btn ghost" data-wb="readiness" ${canAct ? "" : "disabled"}>回写当前准备度</button>
@@ -775,7 +823,7 @@ function writebackPanel(plan) {
     ${lpre(wb.daily_prescriptions).length ? `<table class="tbl" style="margin-top:10px"><thead><tr><th>日期</th><th>版本</th><th>强度区</th><th>建议负荷</th><th>执行</th></tr></thead><tbody>
       ${lpre(wb.daily_prescriptions).map(x => `<tr><td>${x.date}</td><td>v${x.version != null ? x.version : plan.version}</td><td>${esc(x.zone_label || "—")}</td><td>${x.suggested_load != null ? x.suggested_load : "—"}</td><td>${esc(x.plan_status)}</td></tr>`).join("")}
     </tbody></table>` : ""}
-    ${archives.length ? `<details style="margin-top:10px"><summary style="cursor:pointer;font-size:12.5px;color:var(--muted)">历史版本留痕（${archives.length}）</summary>
+    ${archives.length ? `<details style="margin-top:10px"><summary style="cursor:pointer;font-size:12.5px;color:var(--muted)">草稿修订归档（${archives.length} 批）</summary>
       ${[...archives].reverse().map(a => `<div style="font-size:12px;padding:4px 0">v${a.version} · 归档于 ${(a.archived_at || "").replace("T", " ").slice(0, 16)} · 准备度 ${a.readiness_snapshots.length} · 负荷窗口 ${a.load_windows.length} · 处方 ${a.daily_prescriptions.length} 条</div>`).join("")}
     </details>` : ""}
   </div>`;
@@ -784,21 +832,45 @@ function writebackPanel(plan) {
 function schedulePanel(plan) {
   const asOf = plan.as_of || todayStr();
   const dow = ["一", "二", "三", "四", "五", "六", "日"];
+  /* 多版本日程拼接：生效日前的课程归旧版本，之后归活动版本 */
+  const merged = new Map();
+  (plan.versions || []).forEach(v => (v.schedule || []).forEach(d => {
+    if (!merged.has(d.date)) merged.set(d.date, { ...d, v: v.version });
+  }));
+  (plan.schedule || []).forEach(d => merged.set(d.date, { ...d, v: plan.version }));
+  const days = [...merged.values()].sort((a, b) => a.date < b.date ? -1 : 1);
+  const weeks = [];
+  days.forEach(d => {
+    let row = weeks[weeks.length - 1];
+    if (!row || row.week !== d.week) {
+      row = { week: d.week, items: [] };
+      weeks.push(row);
+    }
+    row.items.push(d);
+  });
+  const targetOf = d => {
+    const src = d.v === plan.version ? plan.weekly_targets : (plan.versions || []).find(v => v.version === d.v);
+    const wt = src && src.weekly_targets ? src.weekly_targets.find(w => w.week === d.week) : null;
+    return wt;
+  };
   return `<div class="panel-card"><h3>每日处方日程
       <span style="font-size:12px;color:var(--muted);font-weight:400">实线=已到期/实际 · 虚线=未来计划 · 截止 <input type="date" id="as_of" value="${asOf}" style="border:1px solid var(--line);border-radius:6px;padding:2px 6px;font-size:12px"></span>
     </h3>
-    ${plan.weekly_targets.map((w, wi) => `
+    ${weeks.map(w => {
+      const wt = targetOf(w.items[0]);
+      return `
       <div class="week-head"><b>第 ${w.week} 周</b>
-        <span>目标 <b>${w.target}</b> sRPE ${w.deload ? '<span style="color:var(--amber);font-weight:700">· 减载周</span>' : ""}</span></div>
+        <span>目标 <b>${wt ? wt.target : "—"}</b> sRPE ${wt && wt.deload ? '<span style="color:var(--amber);font-weight:700">· 减载周</span>' : ""} <span style="color:var(--muted)">· v${w.items[0].v}</span></span></div>
       <div class="week-grid">
-        ${plan.schedule.slice(wi * 7, wi * 7 + 7).map(d => `
+        ${w.items.map(d => `
           <div class="day-cell ${d.is_rest ? "rest" : ""} ${d.date > asOf ? "proj" : ""}">
-            <div class="dc-d">周${dow[d.day - 1]} ${d.date.slice(5)}</div>
+            <div class="dc-d">周${dow[d.day - 1]} ${d.date.slice(5)} <span style="font-size:10px;color:var(--muted)">v${d.v}</span></div>
             ${d.is_rest ? `<div class="dc-s">休息 / 恢复</div>` : `
               <div class="dc-l">${d.target_load} sRPE</div>
               <div class="dc-s">${d.sessions.map(s => `${esc(s.sport_label)} ${s.minutes}′ RPE${s.rpe}`).join("<br>")}</div>`}
           </div>`).join("")}
-      </div>`).join("")}
+      </div>`;
+    }).join("")}
   </div>`;
 }
 
@@ -808,7 +880,9 @@ function timelinePanel(plan) {
       <b>${esc(e.actor || roleName(e.role))}</b>（${roleName(e.role)}）${esc({
         create: "创建草稿", edit: "修订计划", submit: "提交确认",
         review_approve: "复核通过", review_changes: "退回修改", confirm: "确认执行",
-        pause: "暂停", resume: "恢复执行", revise: "撤回修订", archive: "归档",
+        pause: "暂停", resume: "恢复执行", revise: "撤回修订",
+        amend: "按生效日期修订", amend_cancel: "撤新生效修订并恢复旧版本",
+        archive: "归档",
         writeback_readiness: "回写准备度", writeback_load: "回写负荷分析", writeback_prescription: "回写每日处方",
       }[e.action] || e.action)}
       ${e.note ? ` · <span style="color:var(--muted)">${esc(e.note)}</span>` : ""}</li>`).join("")}
@@ -821,7 +895,7 @@ function renderWorkspace(plan) {
     <div class="panel-card">
       <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;align-items:center">
         <h3 style="margin:0;font-size:17px">${esc(plan.title)} <span class="badge" style="background:${st.color}">${st.label}</span> ${riskBadgeHtml(plan.risk ? plan.risk.level : null)}</h3>
-        <span style="font-size:12px;color:var(--muted)">版本 v${plan.version}</span>
+        <span style="font-size:12px;color:var(--muted)">版本 v${plan.version} · ${plan.versions && plan.versions.length ? "已保留 " + plan.versions.length + " 个旧版本 · " : ""}本版本生效日 ${plan.effective_date}</span>
       </div>
       <div class="kv" style="margin-top:10px">
         <span>运动员：<b>${esc(plan.athlete_name)}</b></span>
@@ -833,7 +907,7 @@ function renderWorkspace(plan) {
       ${plan.note ? `<div class="risk-item info" style="margin-top:10px">${esc(plan.note)}</div>` : ""}
       <div style="margin-top:12px">${actionButtons(plan)}</div>
     </div>
-    ${riskPanel(plan)}${reviewPanel(plan)}${writebackPanel(plan)}${schedulePanel(plan)}${timelinePanel(plan)}`;
+    ${riskPanel(plan)}${reviewPanel(plan)}${versionsPanel(plan)}${writebackPanel(plan)}${schedulePanel(plan)}${timelinePanel(plan)}`;
   bindWorkspace(plan);
 }
 
@@ -850,16 +924,39 @@ async function doAction(plan, action) {
   const note = $("#act_note") ? $("#act_note").value : "";
   try {
     if (action === "edit") return openCreateDialog(plan);
+    if (action === "amend") {
+      /* 执行中修订：选择新生效日期，旧版本按日期保留 */
+      const def = plan.effective_date >= todayStr() ? plan.effective_date : todayStr();
+      const eff = prompt("新版本自哪一天起生效？\n（该日期及以后归新版本，之前的日子与已确认 / 复核 / 留痕保留在旧版本）", def);
+      if (!eff) return;
+      const payload = await buildAmendPayload(plan, eff, note);
+      await api(`/api/plans/${plan.id}`, "PUT", payload);
+      await loadPlans(plan.id);
+      return;
+    }
     if (action === "approve" || action === "request_changes") {
       await api(`/api/plans/${plan.id}/review`, "POST", { decision: action === "approve" ? "approve" : "request_changes", actor: "当前" + roleName("therapist"), note });
     } else {
       const body = { role: state.role, actor: "当前" + roleName(state.role), note, ...currentAnalysisPayload() };
-      if (action === "revise") body.action = "revise";
-      else body.action = action;
+      body.action = action;
       await api(`/api/plans/${plan.id}/transition`, "POST", body);
     }
     await loadPlans(plan.id);
   } catch (e) { alert(e.message); }
+}
+
+/* 组装生效修订载荷：默认沿用当前参数，生效日默认下周一 */
+async function buildAmendPayload(plan, effectiveDate, note) {
+  const base = currentAnalysisPayload({ role: "coach", actor: "当前教练", note, effective_date: effectiveDate });
+  return {
+    ...base,
+    role: "coach",
+    patch: {
+      title: plan.title, athlete_name: plan.athlete_name, coach_name: plan.coach_name,
+      sport: plan.sport, start_date: plan.start_date, weeks: plan.weeks,
+      base_load: plan.base_load, increment: plan.increment, deload: plan.deload,
+    },
+  };
 }
 
 async function rerunRisk(plan) {
@@ -886,9 +983,9 @@ async function doWriteback(plan, kind) {
       const a = state.data;
       const score = a && a.today.readiness != null ? a.today.readiness : null;
       if (score == null) { box.innerHTML = `<span style="color:var(--red)">请先在模拟/日志页生成带晨测的分析数据</span>`; return; }
-      d = await api(`/api/plans/${plan.id}/writeback/readiness`, "POST", { role: state.role, actor: "当前" + roleName(state.role), entry: { date: a.as_of || a.today.date, score, label: a.today.readiness_label ? a.today.readiness_label.key : null } });
+      d = await api(`/api/plans/${plan.id}/writeback/readiness`, "POST", { role: state.role, actor: "当前" + roleName(state.role), version: plan.version, entry: { date: a.as_of || a.today.date, score, label: a.today.readiness_label ? a.today.readiness_label.key : null } });
     } else {
-      d = await api(`/api/plans/${plan.id}/writeback/` + (kind === "load" ? "load" : "prescription"), "POST", currentAnalysisPayload({ role: state.role, actor: "当前" + roleName(state.role) }));
+      d = await api(`/api/plans/${plan.id}/writeback/` + (kind === "load" ? "load" : "prescription"), "POST", { ...currentAnalysisPayload({ role: state.role, actor: "当前" + roleName(state.role) }), version: plan.version });
     }
     box.innerHTML = `<span style="color:var(--green)">✓ ${kind === "readiness" ? "准备度" : kind === "load" ? "负荷窗口" : "当日处方"}已回写（${new Date().toLocaleTimeString()}）</span>`;
     await openPlan(plan.id);

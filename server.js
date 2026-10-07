@@ -46,7 +46,9 @@ function json(res, code, obj) {
 }
 
 function fail(res, e) {
-  const code = e && (e.code === "forbidden") ? 403 : 400;
+  const code = e && (e.code === "forbidden") ? 403
+    : e && (e.code === "version_conflict") ? 409
+    : 400;
   json(res, code, { error: e.message, code: e.code || "bad_request" });
 }
 
@@ -92,6 +94,17 @@ function planAnalysis(plan, body) {
     plan,
     as_of: body.as_of || null,
   });
+}
+
+/* 执行中按生效日期修订：先在克隆上评估风险（投影按切分后的版本拼接），
+   成功后再对正本执行，保证失败不留半成品 */
+function amendPlanWithRisk(plan, body) {
+  const patch = body.patch || body;
+  const effectiveDate = body.effective_date || patch.effective_date;
+  const trial = JSON.parse(JSON.stringify(plan));
+  PL.amendPlan(trial, patch, { effective_date: effectiveDate, risk: null, actor: body.actor || "" });
+  const assessed = PL.assessRisk(trial, riskContext(trial, body));
+  return PL.amendPlan(plan, patch, { effective_date: effectiveDate, risk: assessed, actor: body.actor || "" });
 }
 
 const server = http.createServer(async (req, res) => {
@@ -188,17 +201,29 @@ const server = http.createServer(async (req, res) => {
       }
       if (!sub && req.method === "PUT") {
         if ((body.role || "coach") !== "coach") return json(res, 403, { error: "仅教练可修订计划", code: "forbidden" });
-        const updated = PL.rebuildPlan(plan, body.patch || body, {});
-        if (Array.isArray(body.sessions) && body.sessions.length) {
-          updated.risk = PL.assessRisk(updated, riskContext(updated, body));
+        let updated;
+        if (plan.status === "executing") {
+          /* 执行中：按生效日期切分保留新旧版本，新版本带风险评估进入待确认 */
+          updated = amendPlanWithRisk(plan, body);
+        } else {
+          updated = PL.rebuildPlan(plan, body.patch || body, {});
+          if (Array.isArray(body.sessions) && body.sessions.length) {
+            updated.risk = PL.assessRisk(updated, riskContext(updated, body));
+          }
         }
         await Store.save(updated);
         return json(res, 200, { plan: updated });
       }
 
       if (sub === "transition" && req.method === "POST") {
+        if (body.action === "amend") {
+          const updated = amendPlanWithRisk(plan, body);
+          await Store.save(updated);
+          return json(res, 200, { plan: updated });
+        }
+        const riskActions = ["submit", "resume"];
         const ctx = riskContext(plan, body);
-        const risk = ["submit", "resume"].includes(body.action) ? PL.assessRisk(plan, ctx) : null;
+        const risk = riskActions.includes(body.action) ? PL.assessRisk(plan, ctx) : null;
         PL.transition(plan, body.action, {
           role: body.role || "coach",
           actor: body.actor || "",
@@ -240,14 +265,14 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (sub === "writeback/readiness" && req.method === "POST") {
-        const rec = PL.writeReadiness(plan, body.entry || body, { actor: body.actor, role: body.role || "coach" });
+        const rec = PL.writeReadiness(plan, body.entry || body, { actor: body.actor, role: body.role || "coach", version: body.version });
         await Store.save(plan);
         return json(res, 200, { plan, entry: rec });
       }
 
       if (sub === "writeback/load" && req.method === "POST") {
         const analysis = planAnalysis(plan, body);
-        const rec = PL.writeLoadWindow(plan, analysis, { actor: body.actor, role: body.role || "coach" });
+        const rec = PL.writeLoadWindow(plan, analysis, { actor: body.actor, role: body.role || "coach", version: body.version });
         await Store.save(plan);
         return json(res, 200, { plan, entry: rec, analysis });
       }
@@ -255,10 +280,10 @@ const server = http.createServer(async (req, res) => {
       if (sub === "writeback/prescription" && req.method === "POST") {
         let rec;
         if (body.prescription && typeof body.prescription === "object") {
-          rec = PL.writePrescription(plan, body.prescription, { actor: body.actor, role: body.role || "coach", date: body.date });
+          rec = PL.writePrescription(plan, body.prescription, { actor: body.actor, role: body.role || "coach", date: body.date, version: body.version });
         } else {
           const analysis = planAnalysis(plan, body);
-          rec = PL.writePrescription(plan, analysis.prescription, { actor: body.actor, role: body.role || "coach" });
+          rec = PL.writePrescription(plan, analysis.prescription, { actor: body.actor, role: body.role || "coach", version: body.version });
         }
         await Store.save(plan);
         return json(res, 200, { plan, entry: rec });

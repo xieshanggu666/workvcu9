@@ -39,16 +39,17 @@ function analyze(athlete, opts = {}) {
       : [plan.start_date, plan.end_date];
   }
 
-  const plannedMap = plan ? new Map(plan.schedule.map(d => [d.date, d])) : null;
+  /* 计划日程按版本切分点合并：生效日之前归旧版本，之后归新版本 */
+  const plannedMap = plan ? PL.mergedSchedule(plan) : null;
   const actualDaily = M.dailyLoads(sessions, "srpe", range);
 
-  /* 拼接实际与投影负荷：计划期内 asOf 之后用计划目标负荷 */
+  /* 拼接实际与投影负荷：计划期内 asOf 之后用计划目标负荷（投影行带归属版本） */
   const mergedDaily = actualDaily.map(d => {
     const planned = plannedMap ? plannedMap.get(d.date) : null;
     if (plan && d.date > asOf && planned) {
-      return { date: d.date, load: planned.target_load, is_projected: true, planned_load: planned.target_load };
+      return { date: d.date, load: planned.target_load, is_projected: true, planned_load: planned.target_load, plan_version: planned.version };
     }
-    return { date: d.date, load: d.load, is_projected: false, planned_load: planned ? planned.target_load : null };
+    return { date: d.date, load: d.load, is_projected: false, planned_load: planned ? planned.target_load : null, plan_version: planned ? planned.version : null };
   });
 
   const loadRows = mergedDaily.map(d => ({ date: d.date, load: d.load }));
@@ -149,6 +150,7 @@ function analyze(athlete, opts = {}) {
       });
       prescription.planned = {
         date: todayItem.date,
+        version: todayItem.version != null ? todayItem.version : plan.version,
         is_rest_day: todayItem.is_rest,
         planned_load: todayItem.target_load,
         sessions: todayItem.sessions,
@@ -190,8 +192,9 @@ function analyze(athlete, opts = {}) {
       as_of: asOf,
       peak_acwr: peak,
       peak_date: peakDate,
-      planned_total: plan.schedule.reduce((s, d) => s + d.target_load, 0),
-      planned_remaining: plan.schedule.filter(d => d.date > asOf).reduce((s, d) => s + d.target_load, 0),
+      peak_version: peakDate && plannedMap.has(peakDate) ? plannedMap.get(peakDate).version : null,
+      planned_total: [...plannedMap.values()].reduce((s, d) => s + d.target_load, 0),
+      planned_remaining: [...plannedMap.values()].filter(d => d.date > asOf).reduce((s, d) => s + d.target_load, 0),
     };
   }
 
@@ -204,6 +207,7 @@ function analyze(athlete, opts = {}) {
       load: row.load,
       is_projected: mergedDaily[i].is_projected,
       planned_load: mergedDaily[i].planned_load,
+      plan_version: mergedDaily[i].plan_version,
       acute: row.acute,
       chronic: row.chronic,
       acwr: row.acwr,
